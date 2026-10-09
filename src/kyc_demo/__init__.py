@@ -1,0 +1,2 @@
+"""Deepfake-resistant onboarding demo."""
+
