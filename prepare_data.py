@@ -93,7 +93,7 @@ def main() -> None:
             unmatched_groups += 1
             continue
         selected.append(chooser.choice(real_rows))
-        selected.append(chooser.choice(fake_rows))
+        selected.extend(fake_rows)
     if not selected:
         parser.error("No source groups contained both a real video and a fake video.")
 
