@@ -83,7 +83,7 @@ def make_live_callback(scorer: VideoScorer):
         score = state["score"]
         if box is not None:
             cv2.rectangle(output, (box[0], box[1]), (box[2], box[3]), (0, 220, 80), 2)
-        label = "No face detected" if score is None else f"Demo fake-like score: {score:.1%}"
+        label = "No face detected" if score is None else f"Real Identity Score: {score:.1%}"
         cv2.rectangle(output, (8, 8), (min(output.shape[1] - 8, 390), 44), (20, 20, 20), -1)
         cv2.putText(output, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
         return av.VideoFrame.from_ndarray(output, format="bgr24")
@@ -143,7 +143,7 @@ with upload_tab:
                     else:
                         score_col, status_col = st.columns(2)
                         with score_col:
-                            st.metric("Fake-like model score", f"{result['clip_score']:.1%}")
+                            st.metric("Real-like model score", f"{result['clip_score']:.1%}")
                         with status_col:
                             st.metric("Risk routing band", result["status"].replace("_", " ").title())
 
