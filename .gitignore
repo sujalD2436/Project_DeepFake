@@ -1,9 +1,13 @@
 __pycache__/
 *.py[cod]
 .venv/
-data/
+data*/
 raw_data/
 models/*.pt
 outputs/
 .streamlit/secrets.toml
+*.mp4
+!samples/*.mp4
+*.db
+*.sqlite3
 

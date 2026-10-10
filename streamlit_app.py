@@ -8,20 +8,27 @@ from pathlib import Path
 import av
 import cv2
 import numpy as np
+import requests
 import streamlit as st
 import torch
-import requests
 from PIL import Image
 from streamlit_webrtc import webrtc_streamer
 
-from src.kyc_demo.config import MODEL_PATH
+from src.kyc_demo.config import DEFAULT_BASE_URL, MODEL_PATH
 from src.kyc_demo.model import bgr_crop_to_tensor
+from src.kyc_demo.qr import extract_token_from_payload, scan_qr_from_bytes
 from src.kyc_demo.scoring import VideoScorer
+from src.kyc_demo.sessions import SessionManager
 
+st.set_page_config(
+    page_title="Fusion KYC & QR Verification",
+    page_icon="🛡️",
+    layout="centered",
+)
+st.title("Identity onboarding & verification")
+st.caption("Deepfake risk signal & ephemeral QR code verification demo.")
 
-st.set_page_config(page_title="Fusion KYC Demo", page_icon="🛡️", layout="centered")
-st.title("Identity onboarding check")
-st.caption("Demo risk signal only. It does not verify identity or prove liveness.")
+session_mgr = SessionManager()
 
 
 @st.cache_resource
@@ -43,8 +50,6 @@ def make_live_callback(scorer: VideoScorer):
         image = frame.to_ndarray(format="bgr24")
         state["frame"] += 1
 
-        # Run CPU face detection and CUDA classifier inference about 5 times/sec
-        # on a typical 30 FPS webcam; annotate the intervening frames cheaply.
         if state["frame"] % 6 == 0:
             height, width = image.shape[:2]
             scale = min(1.0, 640.0 / max(width, height))
@@ -68,7 +73,6 @@ def make_live_callback(scorer: VideoScorer):
                 crop = image[top:bottom, left:right]
                 if crop.size:
                     tensor = bgr_crop_to_tensor(crop, scorer.transform).unsqueeze(0).to(scorer.device)
-                    # A lock prevents simultaneous camera callbacks from entering the model.
                     with inference_lock, torch.inference_mode():
                         probability = torch.softmax(scorer.model(tensor), dim=1)[0, scorer.fake_index]
                     state["score"] = float(probability.item())
@@ -87,11 +91,16 @@ def make_live_callback(scorer: VideoScorer):
     return process
 
 
-live_tab, upload_tab = st.tabs(["Live webcam", "Upload a clip"])
+live_tab, upload_tab, verify_tab = st.tabs([
+    "Live webcam",
+    "Upload clip & onboard",
+    "Reviewer QR verification",
+])
 
+# ----------------- TAB 1: LIVE WEBCAM -----------------
 with live_tab:
     st.write("Start the camera and allow browser camera access. The score updates during the feed.")
-    checkpoint = st.text_input("Model checkpoint", str(MODEL_PATH))
+    checkpoint = st.text_input("Model checkpoint", str(MODEL_PATH), key="live_checkpoint")
     try:
         live_scorer = get_scorer(checkpoint)
     except (FileNotFoundError, OSError, RuntimeError) as exc:
@@ -104,18 +113,19 @@ with live_tab:
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
-    st.caption("Face detection runs on the CPU; the classifier uses CUDA when available. This live score is a demo signal, not a liveness verdict.")
+    st.caption("Live score is an uncalibrated demo signal; it does not verify identity.")
 
+# ----------------- TAB 2: UPLOAD & ONBOARD -----------------
 with upload_tab:
-    st.write("Or upload a short video for the backend to score.")
-    api_url = st.text_input("Inference API", "http://127.0.0.1:8000", key="api_url")
-    uploaded = st.file_uploader("Upload a short video", type=["mp4", "mov", "avi", "mkv"])
+    st.write("Upload a short onboarding clip to score deepfake risk and generate a verification QR code.")
+    api_url = st.text_input("Inference API", DEFAULT_BASE_URL, key="api_url")
+    uploaded = st.file_uploader("Upload video", type=["mp4", "mov", "avi", "mkv"])
 
     if uploaded is not None:
         st.video(uploaded)
         consent = st.checkbox("I have permission to use this clip for this demo.")
-        if st.button("Run check", type="primary", disabled=not consent):
-            with st.spinner("Checking video quality and scoring sampled face frames..."):
+        if st.button("Run onboarding check", type="primary", disabled=not consent):
+            with st.spinner("Checking quality, scoring face crops, and generating verification session..."):
                 try:
                     response = requests.post(
                         f"{api_url.rstrip('/')}/score",
@@ -131,14 +141,169 @@ with upload_tab:
                     if result.get("clip_score") is None:
                         st.warning(result.get("message", "Video needs another capture."))
                     else:
-                        st.metric("Fake-like model score", f"{result['clip_score']:.1%}")
-                        st.info(result["status"].replace("_", " ").title())
+                        score_col, status_col = st.columns(2)
+                        with score_col:
+                            st.metric("Fake-like model score", f"{result['clip_score']:.1%}")
+                        with status_col:
+                            st.metric("Risk routing band", result["status"].replace("_", " ").title())
+
                         st.caption(result.get("message", ""))
+
+                        # Grad-CAM explanation
                         encoded_map = result.get("explanation_png_base64")
                         if encoded_map:
                             st.image(
                                 Image.open(BytesIO(base64.b64decode(encoded_map))),
                                 caption=result.get("explanation_note", "Model attribution map"),
+                                use_container_width=True,
                             )
+
+                        # QR Verification Section
+                        st.divider()
+                        st.subheader("🔒 Reviewer verification QR code")
+                        st.caption(
+                            "Security rule: Contains an unpredictable, expiring token only. "
+                            "No private identity data is stored in the QR code."
+                        )
+
+                        qr_col, info_col = st.columns([1, 2])
+                        qr_base64 = result.get("qr_code_base64")
+                        session_id = result.get("session_id", "N/A")
+                        verification_url = result.get("verification_url", "")
+                        token = result.get("verification_token", "")
+
+                        if qr_base64:
+                            qr_bytes = base64.b64decode(qr_base64)
+                            with qr_col:
+                                st.image(qr_bytes, caption=f"Session: {session_id}", width=180)
+                                st.download_button(
+                                    "Download QR Code",
+                                    data=qr_bytes,
+                                    file_name=f"{session_id}_qr.png",
+                                    mime="image/png",
+                                )
+
+                            with info_col:
+                                st.markdown(f"**Session ID:** `{session_id}`")
+                                st.markdown(f"**Verification Token:** `{token[:8]}...{token[-6:]}`")
+                                st.markdown(f"**Expires At:** `{result.get('expires_at', 'N/A')}`")
+                                if verification_url:
+                                    st.markdown(
+                                        f"📱 **Mobile Review URL:** [Open Reviewer Report]({verification_url})"
+                                    )
+                                st.info("Scan with a smartphone camera or the 'Reviewer QR verification' tab.")
+
                         with st.expander("Frame-level quality details"):
                             st.json(result.get("frame_quality", []))
+
+# ----------------- TAB 3: REVIEWER QR VERIFICATION -----------------
+with verify_tab:
+    st.subheader("Auditor / reviewer verification")
+    st.write("Scan a candidate's QR code using OpenCV or enter a token to verify session authenticity.")
+
+    scan_mode = st.radio(
+        "Verification method",
+        ["📷 Webcam capture (OpenCV)", "📁 Upload QR code image", "⌨️ Enter token manually"],
+        horizontal=True,
+    )
+
+    detected_token = ""
+
+    if scan_mode == "📷 Webcam capture (OpenCV)":
+        st.write("Point your webcam at the QR code displayed on screen or printed badge:")
+        camera_photo = st.camera_input("Capture QR code frame")
+        if camera_photo is not None:
+            photo_bytes = camera_photo.getvalue()
+            with st.spinner("Decoding QR code using OpenCV..."):
+                token, raw_payload = scan_qr_from_bytes(photo_bytes)
+                if token:
+                    st.success(f"QR code detected via OpenCV! Token: `{token[:10]}...`")
+                    detected_token = token
+                else:
+                    st.warning("No readable QR code found in the captured image. Hold it closer or adjust lighting.")
+
+    elif scan_mode == "📁 Upload QR code image":
+        qr_file = st.file_uploader("Upload QR code PNG/JPEG", type=["png", "jpg", "jpeg"])
+        if qr_file is not None:
+            with st.spinner("Decoding QR code using OpenCV..."):
+                token, raw_payload = scan_qr_from_bytes(qr_file.getvalue())
+                if token:
+                    st.success(f"QR code detected! Token: `{token[:10]}...`")
+                    detected_token = token
+                else:
+                    st.error("Could not decode a QR code from this image.")
+
+    else:
+        manual_input = st.text_input("Enter verification token or paste full report URL:")
+        if manual_input.strip():
+            detected_token = extract_token_from_payload(manual_input)
+
+    # Perform Verification & Display Report
+    if detected_token:
+        st.divider()
+        st.subheader("📋 Session verification report")
+
+        # Verify token in backend SQLite
+        is_valid, msg, session = session_mgr.verify_token(detected_token)
+
+        if not session:
+            st.error("Verification token does not match any known session.")
+        else:
+            if not is_valid:
+                st.error(f"Verification Failed: {msg}")
+            else:
+                st.success("Session verified successfully!")
+
+            # Metric cards
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Session ID", session.get("session_id", "N/A"))
+            with col2:
+                clip_score = session.get("clip_score")
+                st.metric(
+                    "Fake-like score",
+                    f"{clip_score:.1%}" if clip_score is not None else "Pending",
+                )
+            with col3:
+                st.metric(
+                    "Status",
+                    session.get("status", "PENDING").replace("_", " ").title(),
+                )
+
+            # Details
+            st.write("---")
+            d1, d2 = st.columns(2)
+            with d1:
+                st.markdown(f"**Created At (UTC):** `{session.get('created_at', 'N/A')}`")
+                st.markdown(f"**Verified At (UTC):** `{session.get('verified_at', 'N/A')}`")
+                st.markdown(f"**Expires At (UTC):** `{session.get('expires_at', 'N/A')}`")
+            with d2:
+                st.markdown(f"**Usable Face Frames:** `{session.get('usable_frames', 0)}`")
+                st.markdown(f"**Token Expired:** `{'Yes' if session.get('is_expired') else 'No'}`")
+                st.markdown(f"**Auditor Verdict:** `{session.get('reviewer_verdict') or 'Pending'}`")
+
+            # Explanation heatmap
+            if session.get("explanation_png_base64"):
+                st.image(
+                    Image.open(BytesIO(base64.b64decode(session["explanation_png_base64"]))),
+                    caption=session.get("explanation_note", "Model attribution heatmap"),
+                    width=320,
+                )
+
+            # Reviewer Action Box
+            st.write("---")
+            st.write("#### Record auditor verdict")
+            with st.form("reviewer_verdict_form"):
+                verdict = st.selectbox(
+                    "Auditor Decision",
+                    ["APPROVED", "FLAGGED FOR FRAUD AUDIT", "REJECTED", "NEEDS RE-CAPTURE"],
+                )
+                notes = st.text_area("Audit Notes", placeholder="e.g. Identity verified against applicant document.")
+                submit_verdict = st.form_submit_button("Record Decision in SQLite", type="primary")
+
+                if submit_verdict:
+                    updated = session_mgr.record_reviewer_verdict(
+                        session["session_id"], verdict, notes
+                    )
+                    st.success(f"Verdict '{verdict}' successfully recorded for session {session['session_id']}!")
+                    st.rerun()
